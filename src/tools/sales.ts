@@ -10,6 +10,10 @@ import type {
   PickList,
   PaginatedResponse,
   SingleResponse,
+  V09Sale,
+  V09RegisterSalesResponse,
+  DailySalesSummary,
+  DailySalesSummaryTransaction,
 } from '../types/lightspeed.js';
 
 // Sale Tools
@@ -276,6 +280,187 @@ export async function listSalePickLists(saleId: string, params: {
       after: params.after,
     },
   });
+}
+
+// ─── Daily Sales Summary ──────────────────────────────────────────────────────
+
+/**
+ * Fetch all closed, non-deleted sales for a given date and compute a complete
+ * revenue waterfall that matches the Lightspeed Sales Report:
+ *
+ *   gross_sales            Full price × qty before discounts
+ *   - total_discounts      Sum of line-item discounts (negative value)
+ *   = net_sales            Post-discount revenue
+ *   - return_amount        Value of return transactions (negative)
+ *   = net_revenue          Matches the "Revenue" column in Lightspeed reports
+ *
+ * The v0.9 /register_sales endpoint returns all data (incl. line items and
+ * payments) in a single paginated call, so we page until we have all records
+ * for the target date, then stop.
+ */
+export async function getDailySalesSummary(params: {
+  date: string;  // YYYY-MM-DD
+}): Promise<DailySalesSummary> {
+  const client = getClient();
+  const targetDate = params.date; // e.g. "2026-05-10"
+
+  // Collect all matching sales across pages
+  const allSales: V09Sale[] = [];
+  let page = 1;
+  let doneCollecting = false;
+
+  // We fetch in descending order (default) and stop when we've passed our date.
+  // Strategy: fetch pages until we see records older than our target date, then stop.
+  // Worst case we over-fetch by one page; that's fine.
+  while (!doneCollecting) {
+    const raw = await client.get<V09RegisterSalesResponse>('/register_sales', {
+      version: '0.9',
+      params: {
+        page_size: 200,
+        page,
+        status: 'CLOSED',
+      },
+    });
+
+    const records = raw.register_sales ?? [];
+    if (records.length === 0) break;
+
+    let foundAny = false;
+    let allOlder = true;
+
+    for (const sale of records) {
+      const saleDay = sale.sale_date.substring(0, 10); // "2026-05-10"
+      if (saleDay === targetDate && !sale.deleted_at) {
+        allSales.push(sale);
+        foundAny = true;
+        allOlder = false;
+      } else if (saleDay > targetDate) {
+        // Still in records newer than target — keep paging
+        allOlder = false;
+      }
+      // saleDay < targetDate contributes to allOlder check
+    }
+
+    // If every record on this page is older than the target date, we're done
+    const oldestOnPage = records[records.length - 1].sale_date.substring(0, 10);
+    if (oldestOnPage < targetDate) {
+      doneCollecting = true;
+    }
+
+    if (raw.pagination && page >= raw.pagination.pages) {
+      doneCollecting = true;
+    }
+
+    page++;
+  }
+
+  // ─── Compute the waterfall ──────────────────────────────────────────────────
+
+  let grossSales = 0;
+  let totalDiscounts = 0;
+  let returnAmount = 0;
+  let taxCollected = 0;
+  let saleCount = 0;
+  let returnCount = 0;
+  const paymentMap = new Map<string, { amount: number; count: number }>();
+
+  const transactions: DailySalesSummaryTransaction[] = [];
+
+  for (const sale of allSales) {
+    const isReturn = !!(sale.return_for && sale.return_for !== '');
+    const products = sale.register_sale_products ?? [];
+    const payments = sale.register_sale_payments ?? [];
+
+    // gross = sum of (unit price × qty) — full price before any discount
+    // net   = sale.total_price — Lightspeed's own post-discount, post-promotion figure
+    //         This is the authoritative number and matches their Sales Report "Revenue" column.
+    // discount = gross - net (derived; the v0.9 line-item `discount` field is unreliable
+    //            — it does not always equal the actual dollar reduction applied)
+    let saleGross = 0;
+
+    for (const p of products) {
+      const qty = Math.abs(Number(p.quantity) || 0);
+      const unitPrice = Number(p.price) || 0;
+      saleGross += unitPrice * qty;
+    }
+
+    const saleNet = Number(sale.total_price) || 0;  // authoritative post-discount revenue
+    const saleDiscount = round2(saleGross - saleNet);        // derived discount
+    const saleTax = Number(sale.total_tax) || 0;
+
+    // Aggregate payment methods
+    for (const pmt of payments) {
+      const methodName = pmt.name || 'Unknown';
+      const pmtAmount = Number(pmt.amount) || 0;
+      if (!paymentMap.has(methodName)) {
+        paymentMap.set(methodName, { amount: 0, count: 0 });
+      }
+      const entry = paymentMap.get(methodName)!;
+      entry.amount += pmtAmount;
+      entry.count += 1;
+    }
+
+    if (isReturn) {
+      returnCount++;
+      returnAmount -= saleNet; // will be negative contribution to revenue
+      taxCollected += saleTax; // tax on returns is typically negative in sale.total_tax
+    } else {
+      saleCount++;
+      grossSales += saleGross;
+      totalDiscounts -= saleDiscount; // store as negative
+      taxCollected += saleTax;
+    }
+
+    // Build transaction record
+    const txPayments = payments.map(p => ({
+      name: p.name || 'Unknown',
+      amount: Number(p.amount) || 0,
+    }));
+
+    transactions.push({
+      invoice_number: sale.invoice_number,
+      sale_date: sale.sale_date,
+      is_return: isReturn,
+      gross: saleGross,
+      discounts: -saleDiscount,
+      net: saleNet,
+      tax: saleTax,
+      payments: txPayments,
+    });
+  }
+
+  const netSales = grossSales + totalDiscounts; // totalDiscounts is already negative
+  const netRevenue = netSales - returnAmount;   // returnAmount is positive, we subtract
+
+  const paymentBreakdown = Array.from(paymentMap.entries())
+    .map(([method, { amount, count }]) => ({ method, amount: round2(amount), count }))
+    .sort((a, b) => b.amount - a.amount);
+
+  return {
+    date: targetDate,
+    store_id: params.date, // will be overwritten by caller with actual store id
+
+    sale_count: saleCount,
+    return_count: returnCount,
+    total_transaction_count: allSales.length,
+
+    gross_sales: round2(grossSales),
+    total_discounts: round2(totalDiscounts),
+    net_sales: round2(netSales),
+    return_amount: round2(-returnAmount),   // show as negative
+    net_revenue: round2(netRevenue),
+
+    tax_collected: round2(taxCollected),
+    avg_sale_value: saleCount > 0 ? round2(netRevenue / saleCount) : 0,
+
+    payment_breakdown: paymentBreakdown,
+
+    transactions: transactions.sort((a, b) => a.sale_date.localeCompare(b.sale_date)),
+  };
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
 }
 
 // Tool definitions for MCP
@@ -692,6 +877,30 @@ export const saleToolDefinitions = [
         after: { type: 'string', description: 'Cursor for pagination' },
       },
       required: ['sale_id'],
+    },
+  },
+  {
+    name: 'lightspeed_daily_sales_summary',
+    description: `Get a complete daily sales summary for a store on a specific date.
+Returns a revenue waterfall that matches the Lightspeed Sales Report:
+  gross_sales → minus discounts → net_sales → minus returns → net_revenue
+Also includes: transaction count, return count, tax collected, average sale value,
+payment method breakdown (cash / card / etc.), and a per-transaction list with
+discount and return flags. Always use this tool when the user asks about sales,
+revenue, or performance for a specific day — do NOT manually paginate register_sales.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        store_id: {
+          type: 'string',
+          description: 'Store ID to query (e.g. "larkgifts", "nerdherd", "ohman", "gettysburggoods"). Required when multiple stores are configured.',
+        },
+        date: {
+          type: 'string',
+          description: 'The date to summarise, in YYYY-MM-DD format (e.g. "2026-05-10").',
+        },
+      },
+      required: ['date'],
     },
   },
 ];

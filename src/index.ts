@@ -222,6 +222,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         result = { success: true, message: 'Sale deleted successfully' };
         break;
 
+      case 'lightspeed_daily_sales_summary': {
+        // resolveClient already set the active store; capture store_id for the response
+        const summary = await sales.getDailySalesSummary({
+          date: toolArgs.date as string,
+        });
+        // Stamp the store_id from args so the response is self-documenting
+        summary.store_id = (toolArgs.store_id as string | undefined) ?? 'unknown';
+        result = summary;
+        break;
+      }
+
       // Inventory tools
       case 'lightspeed_list_inventory':
         result = await inventory.listInventory(toolArgs as Parameters<typeof inventory.listInventory>[0]);

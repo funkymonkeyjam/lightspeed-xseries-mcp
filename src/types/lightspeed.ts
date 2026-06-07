@@ -1114,3 +1114,107 @@ export interface Payment {
   created_at?: string;
   updated_at?: string;
 }
+
+// ─── V0.9 Raw API Response Types (internal use by getDailySalesSummary) ────────
+
+/** Raw line item as returned by the v0.9 /register_sales list endpoint */
+export interface V09SaleProduct {
+  id: string;
+  product_id: string;
+  name?: string;
+  sku?: string;
+  handle?: string;
+  quantity: number;
+  price: number;
+  discount: number;
+  price_total: number;
+  cost?: number;
+  tax?: number;
+  tax_total: number;
+  tax_id?: string;
+  tax_name?: string;
+  status?: string;
+}
+
+/** Raw payment as returned by the v0.9 /register_sales list endpoint */
+export interface V09SalePayment {
+  id: string;
+  name: string;
+  label?: string;
+  payment_type_id?: string;
+  amount: number;
+  payment_date?: string;
+}
+
+/** Raw sale record as returned by the v0.9 /register_sales list endpoint */
+export interface V09Sale {
+  id: string;
+  invoice_number: string;
+  sale_date: string;
+  status: string;
+  deleted_at: string | null;
+  return_for: string;
+  total_price: number;
+  total_tax: number;
+  total_cost?: number;
+  note?: string;
+  register_sale_products: V09SaleProduct[];
+  register_sale_payments: V09SalePayment[];
+  totals?: {
+    total_price?: number;
+    total_tax?: number;
+    total_payment?: number;
+    total_to_pay?: number;
+  };
+}
+
+/** Raw paginated response from v0.9 /register_sales */
+export interface V09RegisterSalesResponse {
+  register_sales: V09Sale[];
+  pagination: {
+    results: number;
+    page: number;
+    page_size: number;
+    pages: number;
+  };
+}
+
+// ─── Daily Sales Summary (output of getDailySalesSummary) ─────────────────────
+
+export interface DailySalesSummaryTransaction {
+  invoice_number: string;
+  sale_date: string;
+  is_return: boolean;
+  gross: number;
+  discounts: number;
+  net: number;
+  tax: number;
+  payments: Array<{ name: string; amount: number }>;
+}
+
+export interface DailySalesSummary {
+  date: string;
+  store_id: string;
+
+  // Transaction counts
+  sale_count: number;
+  return_count: number;
+  total_transaction_count: number;
+
+  // Revenue waterfall (matches Lightspeed Sales Report columns)
+  gross_sales: number;        // Full price × qty, before any discounts
+  total_discounts: number;    // Sum of all discounts applied (shown as negative)
+  net_sales: number;          // gross_sales + total_discounts (post-discount)
+  return_amount: number;      // Value of returned merchandise (shown as negative)
+  net_revenue: number;        // net_sales + return_amount — matches LS "Revenue" column
+
+  // Tax & avg
+  tax_collected: number;
+  avg_sale_value: number;     // net_revenue / sale_count (excluding returns)
+
+  // Payment breakdown
+  payment_breakdown: Array<{ method: string; amount: number; count: number }>;
+
+  // Raw transactions (for drill-down)
+  transactions: DailySalesSummaryTransaction[];
+}
