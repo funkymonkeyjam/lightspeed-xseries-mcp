@@ -74,7 +74,6 @@ export class LightspeedApiClient {
       let errorMessage: string;
       try {
         const errorBody = await response.json() as ErrorBody;
-        // Handle various error response formats from Lightspeed API
         if (errorBody.error && typeof errorBody.error === 'string') {
           errorMessage = `${errorBody.error}${errorBody.error_description ? ` - ${errorBody.error_description}` : ''}`;
         } else if (errorBody.message) {
@@ -97,7 +96,6 @@ export class LightspeedApiClient {
     return response.json() as Promise<T>;
   }
 
-  // Generic CRUD methods
   async get<T>(endpoint: string, options?: { version?: string; params?: Record<string, string | number | boolean | undefined> }): Promise<T> {
     return this.request<T>('GET', endpoint, options);
   }
@@ -118,7 +116,6 @@ export class LightspeedApiClient {
     return this.request<T>('DELETE', endpoint, options);
   }
 
-  // Paginated list helper
   async list<T>(
     endpoint: string,
     options?: {
@@ -129,7 +126,6 @@ export class LightspeedApiClient {
     return this.get<PaginatedResponse<T>>(endpoint, options);
   }
 
-  // Single resource helper
   async getOne<T>(
     endpoint: string,
     options?: { version?: string }
@@ -138,21 +134,164 @@ export class LightspeedApiClient {
   }
 }
 
-// Singleton instance management
-let clientInstance: LightspeedApiClient | null = null;
+// ─── Multi-Store Registry ─────────────────────────────────────────────────────
+
+export interface StoreEntry {
+  id: string;
+  name: string;
+  domainPrefix: string;
+  accessToken: string;
+}
+
+interface StoreConfig {
+  id: string;
+  name?: string;
+  domainPrefix: string;
+  accessToken: string;
+}
+
+const storeRegistry = new Map<string, { meta: StoreEntry; client: LightspeedApiClient }>();
+let activeStoreId: string | null = null;
+
+/**
+ * Initialize all stores from LIGHTSPEED_STORES env var (JSON array) or
+ * fall back to single-store LIGHTSPEED_DOMAIN_PREFIX + LIGHTSPEED_ACCESS_TOKEN.
+ */
+export function initializeStoresFromEnv(): void {
+  const storesJson = process.env.LIGHTSPEED_STORES;
+
+  if (storesJson) {
+    let stores: StoreConfig[];
+    try {
+      stores = JSON.parse(storesJson) as StoreConfig[];
+    } catch {
+      throw new Error('LIGHTSPEED_STORES is not valid JSON. Expected an array of store objects.');
+    }
+
+    if (!Array.isArray(stores) || stores.length === 0) {
+      throw new Error('LIGHTSPEED_STORES must be a non-empty JSON array.');
+    }
+
+    for (const store of stores) {
+      if (!store.id || !store.domainPrefix || !store.accessToken) {
+        throw new Error(`Store entry missing required fields (id, domainPrefix, accessToken): ${JSON.stringify(store)}`);
+      }
+      registerStore(store);
+    }
+
+    // Default active store = first in the list
+    activeStoreId = stores[0].id;
+    console.error(`[lightspeed-mcp] Loaded ${stores.length} store(s): ${stores.map(s => s.id).join(', ')}`);
+    return;
+  }
+
+  // Backward-compat: single-store env vars
+  const domainPrefix = process.env.LIGHTSPEED_DOMAIN_PREFIX;
+  const accessToken = process.env.LIGHTSPEED_ACCESS_TOKEN;
+
+  if (domainPrefix && accessToken) {
+    registerStore({ id: 'default', name: 'Default Store', domainPrefix, accessToken });
+    activeStoreId = 'default';
+    console.error('[lightspeed-mcp] Loaded 1 store (single-store mode via LIGHTSPEED_DOMAIN_PREFIX).');
+    return;
+  }
+
+  // No env config — will rely on per-call args (lazy init)
+  console.error('[lightspeed-mcp] No store credentials in environment. Waiting for per-call initialization.');
+}
+
+export function registerStore(config: StoreConfig): void {
+  const client = new LightspeedApiClient({
+    domainPrefix: config.domainPrefix,
+    accessToken: config.accessToken,
+  });
+  storeRegistry.set(config.id, {
+    meta: {
+      id: config.id,
+      name: config.name ?? config.id,
+      domainPrefix: config.domainPrefix,
+      accessToken: '***', // never expose token in metadata
+    },
+    client,
+  });
+}
+
+/**
+ * Resolve the client to use for a tool call.
+ * Priority: store_id arg → active store → single registered store → lazy init from args.
+ */
+export function resolveClient(args: Record<string, unknown>): LightspeedApiClient {
+  const requestedId = args.store_id as string | undefined;
+
+  // Explicit store_id in args
+  if (requestedId) {
+    const entry = storeRegistry.get(requestedId);
+    if (!entry) {
+      const available = Array.from(storeRegistry.keys()).join(', ') || 'none configured';
+      throw new Error(`Store "${requestedId}" not found. Available stores: ${available}`);
+    }
+    return entry.client;
+  }
+
+  // Use active store if set
+  if (activeStoreId) {
+    const entry = storeRegistry.get(activeStoreId);
+    if (entry) return entry.client;
+  }
+
+  // If exactly one store registered, use it implicitly
+  if (storeRegistry.size === 1) {
+    return storeRegistry.values().next().value!.client;
+  }
+
+  // Multiple stores but no store_id — require explicit selection
+  if (storeRegistry.size > 1) {
+    const available = Array.from(storeRegistry.keys()).join(', ');
+    throw new Error(`Multiple stores configured. Please specify store_id. Available: ${available}`);
+  }
+
+  // No stores registered yet — lazy init from call args (original behavior)
+  const domainPrefix = args.domain_prefix as string | undefined;
+  const accessToken = args.access_token as string | undefined;
+  if (!domainPrefix || !accessToken) {
+    throw new Error(
+      'No stores configured. Set LIGHTSPEED_STORES or LIGHTSPEED_DOMAIN_PREFIX + LIGHTSPEED_ACCESS_TOKEN, ' +
+      'or pass domain_prefix and access_token as tool arguments.'
+    );
+  }
+  registerStore({ id: 'default', domainPrefix, accessToken });
+  activeStoreId = 'default';
+  return storeRegistry.get('default')!.client;
+}
+
+export function listRegisteredStores(): StoreEntry[] {
+  return Array.from(storeRegistry.values()).map(e => e.meta);
+}
+
+export function getStoreCount(): number {
+  return storeRegistry.size;
+}
+
+// ─── Legacy single-store API (backward compat for any external callers) ──────
+
+let legacyClient: LightspeedApiClient | null = null;
 
 export function initializeClient(config: LightspeedConfig): LightspeedApiClient {
-  clientInstance = new LightspeedApiClient(config);
-  return clientInstance;
+  legacyClient = new LightspeedApiClient(config);
+  registerStore({ id: 'default', domainPrefix: config.domainPrefix, accessToken: config.accessToken });
+  activeStoreId = 'default';
+  return legacyClient;
 }
 
 export function getClient(): LightspeedApiClient {
-  if (!clientInstance) {
-    throw new Error('Lightspeed API client not initialized. Please provide domain_prefix and access_token.');
+  if (activeStoreId) {
+    const entry = storeRegistry.get(activeStoreId);
+    if (entry) return entry.client;
   }
-  return clientInstance;
+  if (legacyClient) return legacyClient;
+  throw new Error('Lightspeed API client not initialized. Please provide store credentials.');
 }
 
 export function isClientInitialized(): boolean {
-  return clientInstance !== null;
+  return storeRegistry.size > 0 || legacyClient !== null;
 }

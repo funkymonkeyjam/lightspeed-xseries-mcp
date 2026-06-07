@@ -7,8 +7,9 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 
-import { initializeClient, isClientInitialized } from './utils/api-client.js';
+import { resolveClient, initializeStoresFromEnv } from './utils/api-client.js';
 import { allToolDefinitions } from './tools/index.js';
+import * as stores from './tools/stores.js';
 import * as customers from './tools/customers.js';
 import * as products from './tools/products.js';
 import * as sales from './tools/sales.js';
@@ -56,25 +57,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
-// Helper function to ensure client is initialized
-function ensureClient(args: Record<string, unknown>): void {
-  if (!isClientInitialized()) {
-    // First check environment variables, then fall back to tool arguments
-    const domainPrefix = process.env.LIGHTSPEED_DOMAIN_PREFIX || (args.domain_prefix as string);
-    const accessToken = process.env.LIGHTSPEED_ACCESS_TOKEN || (args.access_token as string);
-
-    if (!domainPrefix || !accessToken) {
-      throw new Error(
-        'Lightspeed API client not initialized. Please set LIGHTSPEED_DOMAIN_PREFIX and LIGHTSPEED_ACCESS_TOKEN environment variables, or provide domain_prefix and access_token parameters.'
-      );
-    }
-
-    initializeClient({
-      domainPrefix,
-      accessToken,
-    });
-  }
-}
+// resolveClient handles multi-store selection via store_id arg or registry defaults
 
 // Handle tool calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -82,10 +65,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const toolArgs = (args || {}) as Record<string, unknown>;
 
   try {
-    // Ensure client is initialized for all tools
-    ensureClient(toolArgs);
-
     let result: unknown;
+
+    // lightspeed_list_stores does not need a client — handle it first
+    if (name === 'lightspeed_list_stores') {
+      result = await stores.listStores();
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      };
+    }
+
+    // Resolve the correct store client (multi-store aware)
+    resolveClient(toolArgs);
 
     switch (name) {
       // Customer tools
@@ -1032,6 +1023,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 // Start the server
 async function main() {
+  // Initialize store registry from environment variables
+  initializeStoresFromEnv();
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error('Lightspeed MCP Server running on stdio');

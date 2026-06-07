@@ -1,5 +1,6 @@
 // Export all tools and their definitions
 
+export * from './stores.js';
 export * from './customers.js';
 export * from './products.js';
 export * from './sales.js';
@@ -19,6 +20,7 @@ export * from './custom-fields.js';
 export * from './rules.js';
 export * from './partner.js';
 
+import { storeToolDefinitions } from './stores.js';
 import { customerToolDefinitions } from './customers.js';
 import { productToolDefinitions } from './products.js';
 import { saleToolDefinitions } from './sales.js';
@@ -40,6 +42,7 @@ import { partnerToolDefinitions } from './partner.js';
 
 // Combine all tool definitions
 export const allToolDefinitions = [
+  ...storeToolDefinitions,
   ...customerToolDefinitions,
   ...productToolDefinitions,
   ...saleToolDefinitions,
