@@ -230,6 +230,8 @@ export function resolveClient(args: Record<string, unknown>): LightspeedApiClien
       const available = Array.from(storeRegistry.keys()).join(', ') || 'none configured';
       throw new Error(`Store "${requestedId}" not found. Available stores: ${available}`);
     }
+    // Update active store so getClient() in tool functions returns the correct client
+    activeStoreId = requestedId;
     return entry.client;
   }
 
