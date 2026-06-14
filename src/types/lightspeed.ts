@@ -1134,6 +1134,7 @@ export interface V09SaleProduct {
   tax_id?: string;
   tax_name?: string;
   status?: string;
+  promotions?: Array<{ id?: string; name?: string; amount?: number }>;
 }
 
 /** Raw payment as returned by the v0.9 /register_sales list endpoint */
@@ -1211,6 +1212,10 @@ export interface DailySalesSummary {
   // Tax & avg
   tax_collected: number;
   avg_sale_value: number;     // net_revenue / sale_count (excluding returns)
+
+  // Discount breakdown (all shown as negative)
+  clearance_count: number;        // Number of line items with a "Clearance" promotion
+  clearance_amount: number;       // Total clearance markdown amount (negative)
 
   // Payment breakdown
   payment_breakdown: Array<{ method: string; amount: number; count: number }>;

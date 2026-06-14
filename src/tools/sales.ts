@@ -362,6 +362,8 @@ export async function getDailySalesSummary(params: {
   let taxCollected = 0;
   let saleCount = 0;
   let returnCount = 0;
+  let clearanceCount = 0;
+  let clearanceAmount = 0;
   const paymentMap = new Map<string, { amount: number; count: number }>();
 
   const transactions: DailySalesSummaryTransaction[] = [];
@@ -371,17 +373,26 @@ export async function getDailySalesSummary(params: {
     const products = sale.register_sale_products ?? [];
     const payments = sale.register_sale_payments ?? [];
 
-    // gross = sum of (unit price × qty) — full price before any discount
-    // net   = sale.total_price — Lightspeed's own post-discount, post-promotion figure
-    //         This is the authoritative number and matches their Sales Report "Revenue" column.
-    // discount = gross - net (derived; the v0.9 line-item `discount` field is unreliable
-    //            — it does not always equal the actual dollar reduction applied)
+    // gross = sum of positive price_total lines only.
+    // Negative price_total lines (TapMango loyalty discounts, qty=-1) are NOT
+    // revenue — including their absolute value in gross inflates both gross and
+    // the derived discount (saleGross - saleNet). Exclude them entirely.
     let saleGross = 0;
 
     for (const p of products) {
-      const qty = Math.abs(Number(p.quantity) || 0);
-      const unitPrice = Number(p.price) || 0;
-      saleGross += unitPrice * qty;
+      const priceTotal = Number(p.price_total) || 0;
+      if (priceTotal <= 0) continue;  // skip negative/zero lines (TapMango etc.)
+      saleGross += priceTotal;
+
+      // Clearance: scan promotions array for name="Clearance"
+      const hasClearance = (p.promotions ?? []).some(
+        promo => promo.name?.toLowerCase() === 'clearance'
+      );
+      if (hasClearance) {
+        clearanceCount++;
+        // The discount field is the markdown delta (retail price - selling price)
+        clearanceAmount -= Number(p.discount) || 0;  // store as negative
+      }
     }
 
     const saleNet = Number(sale.total_price) || 0;  // authoritative post-discount revenue
@@ -452,6 +463,9 @@ export async function getDailySalesSummary(params: {
 
     tax_collected: round2(taxCollected),
     avg_sale_value: saleCount > 0 ? round2(netRevenue / saleCount) : 0,
+
+    clearance_count: clearanceCount,
+    clearance_amount: round2(clearanceAmount),  // already negative
 
     payment_breakdown: paymentBreakdown,
 
